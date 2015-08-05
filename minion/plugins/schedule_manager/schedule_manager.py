@@ -4,10 +4,12 @@
 
 
 import json
+import Queue
 import requests
 import time
 import uuid
 from minion.plugins.base import BlockingPlugin, AbstractPlugin
+from threading import Thread, RLock
 
 
 class SchedulePlugin(BlockingPlugin):
@@ -29,7 +31,9 @@ class SchedulePlugin(BlockingPlugin):
         "plans": [
             "Nmap"
         ],
-        "email": "guillaume.lestel@gmail.com"
+        "email": "guillaume.lestel@gmail.com",
+        "scan_only_good_state": True,
+        "parallel_task": 2
     }
 
     # Instantiation of output
@@ -38,6 +42,14 @@ class SchedulePlugin(BlockingPlugin):
     schedule_stderr = ""
 
     report_dir = "/tmp/"
+
+    # Utils for multi threading
+    scan_queue = Queue.Queue(maxsize=0)
+    counter = 0
+    task_number = 0
+
+    counter_lock = RLock()
+    output_lock = RLock()
 
     def do_run(self):
         # Used for debug
@@ -65,6 +77,12 @@ class SchedulePlugin(BlockingPlugin):
         else:
             email = "schedule@minion.org"
 
+        # Set the number of scan to run in parallel
+        if "parallel_task" in self.configuration:
+            num_worker = self.configuration["parallel_task"]
+        else:
+            num_worker = 1
+
         # Retrieve every target for the group
         try:
             r = requests.get(self.API_PATH + "/groups/" + group)
@@ -88,7 +106,6 @@ class SchedulePlugin(BlockingPlugin):
         targets = r.json()["group"]['sites']
 
         # Build the scan list
-        scan_list = []
         for target in targets:
             # Sleep to not DOS the API
             time.sleep(1)
@@ -107,15 +124,34 @@ class SchedulePlugin(BlockingPlugin):
             for target_plan in target_plans:
                 # Check if the plan is wanted
                 if target_plan in plans:
-                    scan_list.append({"target": target, "plan": target_plan})
+                    self.scan_queue.put({"target": target, "plan": target_plan})
+                    self.task_number += 1
 
                 # Add it anyway if no plan is specified
                 elif not plans:
-                    scan_list.append({"target": target, "plan": target_plan})
+                    self.scan_queue.put({"target": target, "plan": target_plan})
+                    self.task_number += 1
 
-        # Browse the list of jobs to do
-        counter = 0
-        for job in scan_list:
+        # Create workers to launch scans
+        for i in range(num_worker):
+            worker = Thread(target=self.scan_worker, args=(email,))
+            worker.setDaemon(True)
+            worker.start()
+
+        # Wait for the end of all scan
+        self.scan_queue.join()
+
+        # Save result
+        self.schedule_stdout += "Scanning over, scanned " + str(self.task_number) + " targets\n"
+        self._save_artifacts()
+
+        self._finish_with_success(AbstractPlugin.EXIT_STATE_FINISHED)
+
+    def scan_worker(self, email):
+        while True:
+            # Retrieve item to scan
+            job = self.scan_queue.get()
+
             # Launch the scan
             scan = self.launch_scan(email, job["plan"], job["target"])
 
@@ -125,13 +161,20 @@ class SchedulePlugin(BlockingPlugin):
                 issue["Summary"] += " " + scan["reason"]
                 issue["URLs"] = [{"URL": job["target"]}]
 
+                # Report the finished job
                 self.report_issue(issue)
-                counter += 1
+
+                # Update progress
+                self.counter_lock.acquire()
+                self.counter += 1
+                self.counter_lock.release()
+
+                # Update thread synchronization
+                self.scan_queue.task_done()
 
                 continue
 
             # Wait till the scan is finished
-            # TODO FIXME use deferred thread
             while True:
                 time.sleep(10)
 
@@ -146,19 +189,28 @@ class SchedulePlugin(BlockingPlugin):
 
                 # Check if something went wrong
                 if status in ["STOPPED", "FAILED", "ABORTED"]:
+                    self.output_lock.acquire()
+                    self.schedule_stderr += "The scan " + job["plan"] + " on " + job["target"] + \
+                                            " did not success and exited with the status " + status + "\n"
+                    self.output_lock.release()
+
+                    self.scan_queue.task_done()
                     # TODO FIXME the summary of a scan doesn't contain reason if failure
                     break
 
             # Update progress
-            counter += 1
-            self.report_progress(counter/len(scan_list), "Finished scanning " + job["target"])
-            self.schedule_stdout += "Scanned " + job["target"] + " with " + job["plan"] + "\n"
+            self.counter_lock.acquire()
+            self.counter += 1
+            output = "Scanned " + job["target"] + " with " + job["plan"]
+            self.report_progress(self.counter/self.task_number, output)
+            self.counter_lock.release()
 
-        # Save result
-        self.schedule_stdout += "Scanning over, scanned " + str(len(scan_list)) + " targets\n"
-        self._save_artifacts()
+            self.output_lock.acquire()
+            self.schedule_stdout += output + "\n"
+            self.output_lock.release()
 
-        self._finish_with_success(AbstractPlugin.EXIT_STATE_FINISHED)
+            # Update thread synchronization
+            self.scan_queue.task_done()
 
     def launch_scan(self, email, plan, target):
         """ Scan the given target with the given plan
