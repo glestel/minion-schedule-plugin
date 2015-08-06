@@ -32,7 +32,7 @@ class SchedulePlugin(BlockingPlugin):
             "Nmap"
         ],
         "email": "guillaume.lestel@gmail.com",
-        "scan_only_good_state": True,
+        "only_functional": True,
         "parallel_task": 2
     }
 
@@ -45,11 +45,18 @@ class SchedulePlugin(BlockingPlugin):
 
     # Utils for multi threading
     scan_queue = Queue.Queue(maxsize=0)
+    process_list = []
     counter = 0
     task_number = 0
 
     counter_lock = RLock()
     output_lock = RLock()
+
+    # plans planned for scanning
+    plans = []
+
+    # Flag for scanning only - and FINISHED targets
+    only_functional = False
 
     def do_run(self):
         # Used for debug
@@ -62,7 +69,7 @@ class SchedulePlugin(BlockingPlugin):
 
         # Get the array of plans to run
         if "plans" in self.configuration:
-            plans = self.configuration.get('plans')
+            self.plans = self.configuration.get('plans')
 
         # Get the name of the group to run (mandatory)
         if "group" in self.configuration:
@@ -82,6 +89,10 @@ class SchedulePlugin(BlockingPlugin):
             num_worker = self.configuration["parallel_task"]
         else:
             num_worker = 1
+
+        # Set flag for scanning only - or FINISHED target
+        if "only_functional" in self.configuration:
+            self.only_functional = self.configuration.get("only_functional")
 
         # Retrieve every target for the group
         try:
@@ -111,26 +122,23 @@ class SchedulePlugin(BlockingPlugin):
             time.sleep(1)
             # Get plans associated to the target
             r = requests.get(self.API_PATH + "/sites?url=" + target)
-            r.raise_for_status()
 
             # FIXME sometimes the API responds with blank answer
             try:
+                r.raise_for_status()
                 target_plans = r.json()['sites'][0]["plans"]
+                target_id = r.json()['sites'][0]["id"]
             except Exception as e:
                 self.schedule_stderr += e.message + "\n"
                 continue
 
             # Browse every plan of a target
             for target_plan in target_plans:
-                # Check if the plan is wanted
-                if target_plan in plans:
-                    self.scan_queue.put({"target": target, "plan": target_plan})
-                    self.task_number += 1
+                # Add plan to the list if needed
+                self.check_plan(target, target_plan, target_id)
 
-                # Add it anyway if no plan is specified
-                elif not plans:
-                    self.scan_queue.put({"target": target, "plan": target_plan})
-                    self.task_number += 1
+        # Sort the scans to schedule into a prioritized order
+        self.sort_scans()
 
         # Create workers to launch scans
         for i in range(num_worker):
@@ -146,6 +154,65 @@ class SchedulePlugin(BlockingPlugin):
         self._save_artifacts()
 
         self._finish_with_success(AbstractPlugin.EXIT_STATE_FINISHED)
+
+    # Function used to add the target with its plan to the scan_queue
+    # Will add scan regarding configuration set during initialization
+    # Params:
+    #   target : url to scan
+    #   target_plan : plan to apply
+    #   target_id : id of the url in minion
+    def check_plan(self, target, target_plan, target_id):
+        # Check if the plan is wanted the expected plans are defined
+        if target_plan not in self.plans and self.plans:
+            return
+
+        # Get the status of the last scan
+        params = {'site_id': target_id, 'plan_name': target_plan, 'limit': 1}
+        r = requests.get(self.API_PATH + "/scans", params=params)
+
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            self.schedule_stderr += e.message + "\n"
+            return
+
+        j = r.json()
+
+        # Check the request has results
+        if not j.get('success'):
+            msg = str("Can't get the last scan for the site %s and plan %s, reason : %s" %
+                      (target, target_plan, j.get('reason')))
+            self.schedule_stderr += msg + "\n"
+
+            return
+
+        # Get info about last scan
+        last_scan = j.get("scans")
+
+        # Set default value if the scan has never been started
+        if not last_scan:
+            started_date = 0
+            state = "-"
+        else:
+            started_date = last_scan[0]["created"]
+            state = last_scan[0]["state"]
+
+        # Check if the last scan must have well finished
+        if self.only_functional and state not in ["FINISHED", "-"]:
+            return
+
+        # Add info to the process list
+        self.process_list.append({"target": target, "plan": target_plan, "started": started_date, "state": state})
+        self.task_number += 1
+
+    # Function used to sort the scans planned and order them into the scanning queue
+    def sort_scans(self):
+        # Order from ascending start date (never started scan will be in first)
+        self.process_list.sort(key=lambda scan_job: scan_job["started"])
+
+        # Import result into the queue
+        for job in self.process_list:
+            self.scan_queue.put(job)
 
     def scan_worker(self, email):
         while True:
