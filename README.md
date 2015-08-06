@@ -34,10 +34,18 @@ Example of plan
 Available configuration option
 ------------------------------
 Most of the options are not mandatory and have default values.
-* ```report_dir``` : directory where output and reports will be saved. By default, the path used is `/tmp/artifacts`
+* ```report_dir``` : directory where the reports will be saved. By default, the path used is `/tmp/artifacts`
 * ```group ``` : name of the group in Minion that will be used for running the scan campaign. This option is mandatory
 * ```plans ``` : array containing name of plans to run. 
 * ```parallel_task ``` : number of scan to run simultaneously. Default value is `1` (single thread) 
 * ```only_functional ``` : run scan only if the previous scan ended in a `FINISHED` state or was never launched. Default value is `False`
 * ```email ``` : email of the account that will be used for launching scans. This option is mandatory and the email need to be valid.
+
+Setting up a campaign
+--------------------
+Currently this plugin works as a workaround. Once the plugin is installed on Minion, the steps are:
+* Creating a plan with a specified group where the campaign will be run
+* Creating a bogus target like `Scheduling.localhost` and assigning it the created plan
+* On the user interface, running the available scan to launch the designed campaign
+
 
