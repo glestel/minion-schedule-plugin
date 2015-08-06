@@ -25,23 +25,12 @@ class SchedulePlugin(BlockingPlugin):
         "URLs": [{"URL": None, "Extra": None}],
         }
 
-    alt_configuration = {
-        "report_dir": "/tmp/artifacts/",
-        "group": "test",
-        "plans": [
-            "Nmap"
-        ],
-        "email": "guillaume.lestel@gmail.com",
-        "only_functional": True,
-        "parallel_task": 2
-    }
-
     # Instantiation of output
     output_id = str(uuid.uuid4())
     schedule_stdout = ""
     schedule_stderr = ""
 
-    report_dir = "/tmp/"
+    report_dir = "/tmp/artifacts"
 
     # Utils for multi threading
     scan_queue = Queue.Queue(maxsize=0)
@@ -59,10 +48,6 @@ class SchedulePlugin(BlockingPlugin):
     only_functional = False
 
     def do_run(self):
-        # Used for debug
-        if not self.configuration:
-            self.configuration = self.alt_configuration
-
         # Get the path to save output
         if 'report_dir' in self.configuration:
             self.report_dir = self.configuration['report_dir']
@@ -76,13 +61,30 @@ class SchedulePlugin(BlockingPlugin):
             group = self.configuration.get('group')
         else:
             self.schedule_stderr += "No group is specified for the scheduled run\n"
-            raise Exception('No group is specified for the scheduled run')
+            self.schedule_stderr += "This option is mandatory, and the group need to be valid.\n"
+            self._save_artifacts()
+
+            failure = {
+                "hostname": "Utils plugins",
+                "exception": self.schedule_stderr,
+                "message": "Plugin Failed : missing email"
+            }
+            self._finish_with_failure(failure)
 
         # Get the email for scan configuration
         if "email" in self.configuration:
             email = self.configuration.get('email')
         else:
-            email = "schedule@minion.org"
+            self.schedule_stderr += "No email is specified for the scheduled run.\n"
+            self.schedule_stderr += "This option is mandatory, and the email need to be a valid account.\n"
+            self._save_artifacts()
+
+            failure = {
+                "hostname": "Utils plugins",
+                "exception": self.schedule_stderr,
+                "message": "Plugin Failed : missing email"
+            }
+            self._finish_with_failure(failure)
 
         # Set the number of scan to run in parallel
         if "parallel_task" in self.configuration:
