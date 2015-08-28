@@ -9,7 +9,7 @@ import requests
 import time
 import uuid
 from minion.plugins.base import BlockingPlugin, AbstractPlugin
-from threading import Thread, RLock
+from threading import Thread, RLock, Event
 
 
 class SchedulePlugin(BlockingPlugin):
@@ -38,6 +38,9 @@ class SchedulePlugin(BlockingPlugin):
     counter = 0
     task_number = 0
 
+    # Create a synchronized flag if the schedule need to be stopped
+    stop_event = Event()
+
     counter_lock = RLock()
     output_lock = RLock()
 
@@ -56,9 +59,9 @@ class SchedulePlugin(BlockingPlugin):
         if "plans" in self.configuration:
             self.plans = self.configuration.get('plans')
 
-        # Get the name of the group to run (mandatory)
-        if "group" in self.configuration:
-            group = self.configuration.get('group')
+        # Get the array of groups to run (mandatory)
+        if "groups" in self.configuration:
+            groups = self.configuration.get('groups')
         else:
             self.schedule_stderr += "No group is specified for the scheduled run\n"
             self.schedule_stderr += "This option is mandatory, and the group need to be valid.\n"
@@ -96,51 +99,55 @@ class SchedulePlugin(BlockingPlugin):
         if "only_functional" in self.configuration:
             self.only_functional = self.configuration.get("only_functional")
 
-        # Retrieve every target for the group
-        try:
-            r = requests.get(self.API_PATH + "/groups/" + group)
-            r.raise_for_status()
-        except Exception as e:
-            self.schedule_stderr += e.message
-            self._save_artifacts()
-
-            failure = {
-                "hostname": "Utils plugins",
-                "exception": self.schedule_stderr,
-                "message": "Plugin failed"
-            }
-            self._finish_with_failure(failure)
-
-        # Check the request is successful
-        success = r.json()["success"]
-        if not success:
-            raise Exception("Could not retrieve info about group " + group + " because " + r.json()["reason"])
-
-        targets = r.json()["group"]['sites']
-
-        # Build the scan list
-        for target in targets:
-            # Sleep to not DOS the API
-            time.sleep(1)
-            # Get plans associated to the target
-            r = requests.get(self.API_PATH + "/sites?url=" + target)
-
-            # FIXME sometimes the API responds with blank answer
+        # Retrieve every target for every group
+        for group in groups:
             try:
+                r = requests.get(self.API_PATH + "/groups/" + group)
                 r.raise_for_status()
-                target_plans = r.json()['sites'][0]["plans"]
-                target_id = r.json()['sites'][0]["id"]
             except Exception as e:
-                self.schedule_stderr += e.message + "\n"
-                continue
+                self.schedule_stderr += e.message
+                self._save_artifacts()
 
-            # Browse every plan of a target
-            for target_plan in target_plans:
-                # Add plan to the list if needed
-                self.check_plan(target, target_plan, target_id)
+                failure = {
+                    "hostname": "Utils plugins",
+                    "exception": self.schedule_stderr,
+                    "message": "Plugin failed"
+                }
+                self._finish_with_failure(failure)
+
+            # Check the request is successful
+            success = r.json()["success"]
+            if not success:
+                raise Exception("Could not retrieve info about group " + group + " because " + r.json()["reason"])
+
+            targets = r.json()["group"]['sites']
+
+            # Build the scan list
+            for target in targets:
+                # Sleep to not DOS the API
+                time.sleep(1)
+                # Get plans associated to the target
+                r = requests.get(self.API_PATH + "/sites?url=" + target)
+
+                try:
+                    r.raise_for_status()
+                    target_plans = r.json()['sites'][0]["plans"]
+                    target_id = r.json()['sites'][0]["id"]
+                except Exception as e:
+                    self.schedule_stderr += e.message + "\n"
+                    continue
+
+                # Browse every plan of a target
+                for target_plan in target_plans:
+                    # Add plan to the list if needed
+                    self.check_plan(target, target_plan, target_id)
+
+        self.schedule_stdout += "Building of task list over\n"
 
         # Sort the scans to schedule into a prioritized order
         self.sort_scans()
+
+        self.schedule_stdout += "Task list sorted, " + str(self.task_number) + " to process\n"
 
         # Create workers to launch scans
         for i in range(num_worker):
@@ -203,21 +210,28 @@ class SchedulePlugin(BlockingPlugin):
         if self.only_functional and state not in ["FINISHED", "-"]:
             return
 
+        # Compute the task id (used for removing duplicate later)
+        task_id = target_id + target_plan
+
         # Add info to the process list
-        self.process_list.append({"target": target, "plan": target_plan, "started": started_date, "state": state})
-        self.task_number += 1
+        self.process_list.append({"id": task_id, "target": target, "plan": target_plan,
+                                  "started": started_date, "state": state})
 
     # Function used to sort the scans planned and order them into the scanning queue
     def sort_scans(self):
+        # Remove duplicate
+        self.process_list = {v['id']: v for v in self.process_list}.values()
+
         # Order from ascending start date (never started scan will be in first)
         self.process_list.sort(key=lambda scan_job: scan_job["started"])
 
         # Import result into the queue
         for job in self.process_list:
             self.scan_queue.put(job)
+            self.task_number += 1
 
     def scan_worker(self, email):
-        while True:
+        while not self.stop_event.is_set():
             # Retrieve item to scan
             job = self.scan_queue.get()
 
@@ -244,7 +258,7 @@ class SchedulePlugin(BlockingPlugin):
                 continue
 
             # Wait till the scan is finished
-            while True:
+            while not self.stop_event.is_set():
                 time.sleep(10)
 
                 # Get the scan status
@@ -344,6 +358,18 @@ class SchedulePlugin(BlockingPlugin):
 
         if output_artifacts:
             self.report_artifacts("Schedule Output", output_artifacts)
+
+    def do_stop(self):
+        # Kill running threads
+        self.stop_event.set()
+
+        # Save artifacts
+        self.output_lock.acquire()
+        self._save_artifacts()
+        self.output_lock.release()
+
+        # Call parent method
+        BlockingPlugin.do_stop(self)
 
 
 # used for debug purpose
