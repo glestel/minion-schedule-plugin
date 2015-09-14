@@ -4,6 +4,7 @@
 
 
 import json
+import logging
 import Queue
 import requests
 import time
@@ -26,11 +27,14 @@ class SchedulePlugin(BlockingPlugin):
         }
 
     # Instantiation of output
+    report_dir = "/tmp/artifacts/"
+
     output_id = str(uuid.uuid4())
     schedule_stdout = ""
     schedule_stderr = ""
+    logger = ""
+    logger_path = report_dir + "logging_" + output_id + ".txt"
 
-    report_dir = "/tmp/artifacts"
 
     # Utils for multi threading
     scan_queue = Queue.Queue(maxsize=0)
@@ -54,6 +58,7 @@ class SchedulePlugin(BlockingPlugin):
         # Get the path to save output
         if 'report_dir' in self.configuration:
             self.report_dir = self.configuration['report_dir']
+            self.logger_path = self.report_dir + "logging_" + self.output_id + ".txt"
 
         # Get the array of plans to run
         if "plans" in self.configuration:
@@ -98,6 +103,30 @@ class SchedulePlugin(BlockingPlugin):
         # Set flag for scanning only - or FINISHED target
         if "only_functional" in self.configuration:
             self.only_functional = self.configuration.get("only_functional")
+
+        # create logger
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG)
+
+        # create console handler and set level to debug
+        ch = logging.FileHandler(self.logger_path)
+        ch.setLevel(logging.DEBUG)
+
+        # create formatter
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+        # add formatter to ch
+        ch.setFormatter(formatter)
+
+        # add ch to logger
+        logger.addHandler(ch)
+
+        # 'application' code
+        logger.debug('debug message')
+        logger.info('info message')
+        logger.warn('warn message')
+        logger.error('error message')
+        logger.critical('critical message')
 
         # Retrieve every target for every group
         for group in groups:
@@ -159,7 +188,7 @@ class SchedulePlugin(BlockingPlugin):
         self.scan_queue.join()
 
         # Save result
-        self.schedule_stdout += "Scanning over, scanned " + str(self.task_number) + " targets\n"
+        self.schedule_stdout += "Scanning over, scanned " + str(self.counter) + " targets\n"
         self._save_artifacts()
 
         self._finish_with_success(AbstractPlugin.EXIT_STATE_FINISHED)
@@ -177,9 +206,9 @@ class SchedulePlugin(BlockingPlugin):
 
         # Get the status of the last scan
         params = {'site_id': target_id, 'plan_name': target_plan, 'limit': 1}
-        r = requests.get(self.API_PATH + "/scans", params=params)
 
         try:
+            r = requests.get(self.API_PATH + "/scans", params=params)
             r.raise_for_status()
         except Exception as e:
             self.schedule_stderr += e.message + "\n"
@@ -234,6 +263,11 @@ class SchedulePlugin(BlockingPlugin):
         while not self.stop_event.is_set():
             # Retrieve item to scan
             job = self.scan_queue.get()
+
+            output = "To scan : " + job["target"] + " with " + job["plan"]
+            self.output_lock.acquire()
+            self.schedule_stdout += output + "\n"
+            self.output_lock.release()
 
             # Launch the scan
             scan = self.launch_scan(email, job["plan"], job["target"])
@@ -355,6 +389,8 @@ class SchedulePlugin(BlockingPlugin):
             with open(stderr_log, 'w+') as f:
                 f.write(self.schedule_stderr)
             output_artifacts.append(stderr_log)
+
+        output_artifacts.append(self.logger_path)
 
         if output_artifacts:
             self.report_artifacts("Schedule Output", output_artifacts)
