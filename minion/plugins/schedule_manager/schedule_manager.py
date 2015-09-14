@@ -270,7 +270,13 @@ class SchedulePlugin(BlockingPlugin):
             self.output_lock.release()
 
             # Launch the scan
-            scan = self.launch_scan(email, job["plan"], job["target"])
+            try:
+                scan = self.launch_scan(email, job["plan"], job["target"])
+            except Exception as e:
+                output = "Can't scan : " + job["target"] + " with " + job["plan"] + " error was " + e.message
+                self.output_lock.acquire()
+                self.schedule_stderr += output + "\n"
+                self.output_lock.release()
 
             # Check the scan has been well started
             if not scan["success"]:
