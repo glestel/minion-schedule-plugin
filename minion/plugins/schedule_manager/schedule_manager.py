@@ -302,8 +302,17 @@ class SchedulePlugin(BlockingPlugin):
                 time.sleep(10)
 
                 # Get the scan status
-                r = requests.get(self.API_PATH + "/scans/" + scan["id"] + "/summary")
-                r.raise_for_status()
+                try:
+                    r = requests.get(self.API_PATH + "/scans/" + scan["id"] + "/summary")
+                    r.raise_for_status()
+                except Exception as e:
+                    output = "Can't get info on scan : " + job["target"] + " with " + job["plan"] \
+                             + " error was " + e.message
+                    self.output_lock.acquire()
+                    self.schedule_stderr += output + "\n"
+                    self.output_lock.release()
+                    break
+
                 status = r.json()["summary"]["state"]
 
                 # Check if the scan is finished
@@ -317,7 +326,6 @@ class SchedulePlugin(BlockingPlugin):
                                             " did not success and exited with the status " + status + "\n"
                     self.output_lock.release()
 
-                    self.scan_queue.task_done()
                     # TODO FIXME the summary of a scan doesn't contain reason if failure
                     break
 
@@ -325,7 +333,7 @@ class SchedulePlugin(BlockingPlugin):
             self.counter_lock.acquire()
             self.counter += 1
             output = "Scanned " + job["target"] + " with " + job["plan"]
-            self.report_progress(self.counter/self.task_number, output)
+            # self.report_progress(self.counter/self.task_number, output)  # Not implemented yet
             self.counter_lock.release()
 
             self.output_lock.acquire()
